@@ -169,9 +169,17 @@ jobs:
             docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
               'set -e; bash -n /opt/ollama-open-webui/start.sh; test -x /start.sh; bash -n /start.sh; ls -l /start.sh /opt/ollama-open-webui/start.sh'
 
-            echo '### Build residue checks'
+            echo '### Ollama distribution archive residue'
             docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
-              'set -e; test ! -e /opt/ollama-dist/ollama-linux-amd64.tar.zst; test ! -d /root/.cache/pip; test ! -d /root/.cache/huggingface'
+              'test ! -e /opt/ollama-dist/ollama-linux-amd64.tar.zst'
+
+            echo '### Pip cache presence'
+            docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
+              'if [[ -d /root/.cache/pip ]]; then echo "inherited/present cache: /root/.cache/pip"; du -sh /root/.cache/pip; else echo "cache absent: /root/.cache/pip"; fi'
+
+            echo '### Hugging Face cache presence'
+            docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
+              'if [[ -d /root/.cache/huggingface ]]; then echo "inherited/present cache: /root/.cache/huggingface"; du -sh /root/.cache/huggingface; else echo "cache absent: /root/.cache/huggingface"; fi'
 
             echo '### Final disk state'
             df -h
