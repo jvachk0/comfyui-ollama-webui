@@ -1,0 +1,124 @@
+name: Publish image to GHCR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    name: Build, publish, and inspect linux/amd64 image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      IMAGE_NAME: ghcr.io/jvachk0/comfyui-ollama-webui
+
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v6
+        with:
+          ref: 1235c6d5fbe2ac95a56765d6b230ca9da5b69e4e
+
+      - name: Reclaim runner disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          safe_remove_dir() {
+            local target="$1"
+            case "$target" in
+              /usr/local/lib/android|/usr/share/dotnet|/opt/ghc|/usr/local/.ghcup|/opt/hostedtoolcache)
+                ;;
+              *)
+                echo "Refusing unexpected cleanup target: $target" >&2
+                return 1
+                ;;
+            esac
+
+            if [[ -L "$target" ]]; then
+              echo "Skipping symlink cleanup target: $target"
+            elif [[ -d "$target" ]]; then
+              resolved=$(realpath -e -- "$target")
+              [[ "$resolved" == "$target" ]]
+              sudo rm -rf --one-file-system -- "$target"
+            fi
+          }
+
+          safe_remove_dir /usr/local/lib/android
+          safe_remove_dir /usr/share/dotnet
+          safe_remove_dir /opt/ghc
+          safe_remove_dir /usr/local/.ghcup
+          safe_remove_dir /opt/hostedtoolcache
+          sudo apt-get clean
+          docker system prune --all --force --volumes
+          df -h
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push verified image
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: ./docker-image
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          tags: |
+            ghcr.io/jvachk0/comfyui-ollama-webui:v0.1.0
+            ghcr.io/jvachk0/comfyui-ollama-webui:cuda13
+
+      - name: Inspect registry manifest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          reference="${IMAGE_NAME}@${DIGEST}"
+          docker buildx imagetools inspect "$reference"
+          docker buildx imagetools inspect --raw "$reference" > manifest.json
+
+          media_type=$(jq -r '.mediaType' manifest.json)
+          compressed_size=$(jq '[.config.size, (.layers[]?.size)] | add' manifest.json)
+
+          echo "REGISTRY_DIGEST=${DIGEST}"
+          echo "MANIFEST_MEDIA_TYPE=${media_type}"
+          echo "COMPRESSED_REGISTRY_SIZE_BYTES=${compressed_size}"
+
+      - name: Verify public pull and inspect image config
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          reference="${IMAGE_NAME}@${DIGEST}"
+
+          docker logout ghcr.io
+          for attempt in 1 2 3 4 5; do
+            if docker pull --platform linux/amd64 "$reference"; then
+              break
+            fi
+            if [[ "$attempt" == 5 ]]; then
+              echo "Anonymous pull failed: GHCR package is not publicly accessible." >&2
+              exit 1
+            fi
+            sleep 15
+          done
+
+          echo 'VISIBILITY=public (anonymous digest pull succeeded)'
+          docker image inspect "$reference" --format 'architecture={{.Architecture}} os={{.Os}}'
+          docker image inspect "$reference" --format 'config={{json .Config}}'
+          docker image inspect "$reference" --format 'entrypoint={{json .Config.Entrypoint}}'
+          docker image inspect "$reference" --format 'cmd={{json .Config.Cmd}}'
+          docker image inspect "$reference" --format 'exposed_ports={{json .Config.ExposedPorts}}'
+          docker image inspect "$reference" --format 'local_uncompressed_size_bytes={{.Size}}'
