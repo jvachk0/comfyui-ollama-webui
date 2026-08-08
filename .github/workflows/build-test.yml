@@ -1,0 +1,202 @@
+name: Build and test image (no push)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-test-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-test:
+    name: linux/amd64 build and static image tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    env:
+      IMAGE_TAG: local/runpod-comfyui-ollama-webui:test
+      BUILD_LOG: build-test.log
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Disk before cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### Disk before cleanup'
+            date --iso-8601=seconds
+            df -h
+            docker system df || true
+          } | tee "$BUILD_LOG"
+
+      - name: Safely remove unused runner software
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          safe_remove_dir() {
+            local target="$1"
+            case "$target" in
+              /usr/local/lib/android|/usr/share/dotnet|/opt/ghc|/usr/local/.ghcup|/opt/hostedtoolcache)
+                ;;
+              *)
+                echo "Refusing unexpected cleanup target: $target" >&2
+                return 1
+                ;;
+            esac
+
+            if [[ -L "$target" ]]; then
+              echo "Skipping symlink cleanup target: $target" >&2
+              return 0
+            fi
+            if [[ -d "$target" ]]; then
+              local resolved
+              resolved=$(realpath -e -- "$target")
+              [[ "$resolved" == "$target" ]] || {
+                echo "Resolved cleanup target mismatch: $target -> $resolved" >&2
+                return 1
+              }
+              sudo du -sh -- "$target" || true
+              sudo rm -rf --one-file-system -- "$target"
+            else
+              echo "Cleanup target absent: $target"
+            fi
+          }
+
+          {
+            echo '### Removing preinstalled SDKs not needed by this Docker build'
+            safe_remove_dir /usr/local/lib/android
+            safe_remove_dir /usr/share/dotnet
+            safe_remove_dir /opt/ghc
+            safe_remove_dir /usr/local/.ghcup
+            safe_remove_dir /opt/hostedtoolcache
+
+            echo '### Cleaning package-manager and Docker leftovers'
+            sudo apt-get clean
+            if [[ -d /var/lib/apt/lists && ! -L /var/lib/apt/lists ]]; then
+              sudo find /var/lib/apt/lists -mindepth 1 -delete
+            fi
+            docker system prune --all --force --volumes
+
+            echo '### Disk after cleanup'
+            df -h
+            docker system df || true
+          } 2>&1 | tee -a "$BUILD_LOG"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build linux/amd64 image locally
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### Build start'
+            date --iso-8601=seconds
+            df -h
+          } | tee -a "$BUILD_LOG"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --load \
+            --tag "$IMAGE_TAG" \
+            --progress plain \
+            ./docker-image 2>&1 | tee -a "$BUILD_LOG"
+
+          {
+            echo '### Disk after build'
+            date --iso-8601=seconds
+            df -h
+            docker system df
+          } | tee -a "$BUILD_LOG"
+
+      - name: Inspect and test image
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo '### Image architecture'
+            docker image inspect "$IMAGE_TAG" --format 'architecture={{.Architecture}} os={{.Os}}'
+            [[ $(docker image inspect "$IMAGE_TAG" --format '{{.Architecture}}') == amd64 ]]
+
+            echo '### Entrypoint and command'
+            docker image inspect "$IMAGE_TAG" --format 'entrypoint={{json .Config.Entrypoint}} cmd={{json .Config.Cmd}}'
+            [[ $(docker image inspect "$IMAGE_TAG" --format '{{json .Config.Entrypoint}}') == '["/sbin/docker-init","--"]' ]]
+            [[ $(docker image inspect "$IMAGE_TAG" --format '{{json .Config.Cmd}}') == '["/opt/ollama-open-webui/start.sh"]' ]]
+
+            echo '### Exposed ports'
+            docker image inspect "$IMAGE_TAG" --format '{{json .Config.ExposedPorts}}'
+            exposed=$(docker image inspect "$IMAGE_TAG" --format '{{json .Config.ExposedPorts}}')
+            [[ "$exposed" == *'"3000/tcp"'* ]]
+            [[ "$exposed" == *'"8188/tcp"'* ]]
+            [[ "$exposed" == *'"8888/tcp"'* ]]
+            [[ "$exposed" != *'"11434/tcp"'* ]]
+
+            echo '### Image size'
+            docker image inspect "$IMAGE_TAG" --format 'bytes={{.Size}}'
+            docker image ls "$IMAGE_TAG"
+
+            echo '### Docker history'
+            docker history --no-trunc "$IMAGE_TAG"
+
+            echo '### Ollama version'
+            docker run --rm --entrypoint /usr/bin/ollama "$IMAGE_TAG" --version
+
+            echo '### Open WebUI version'
+            docker run --rm --entrypoint /opt/open-webui/venv/bin/python "$IMAGE_TAG" \
+              -c 'from importlib.metadata import version; print(version("open-webui"))'
+
+            echo '### Open WebUI pip check'
+            docker run --rm --entrypoint /usr/bin/env "$IMAGE_TAG" \
+              -u PIP_CONSTRAINT \
+              /opt/open-webui/venv/bin/python -m pip check
+
+            echo '### Open WebUI Torch version and path'
+            docker run --rm --entrypoint /opt/open-webui/venv/bin/python "$IMAGE_TAG" \
+              -c 'import torch; print(torch.__version__); print(torch.__file__); print(torch.version.cuda)'
+
+            echo '### Separate Torch/CUDA stack'
+            docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
+              'set -e; test -d /opt/open-webui/venv/lib/python3.12/site-packages/torch; test -d /opt/open-webui/venv/lib/python3.12/site-packages/nvidia; du -sh /opt/open-webui/venv/lib/python*/site-packages/torch* /opt/open-webui/venv/lib/python*/site-packages/nvidia*'
+
+            echo '### Startup scripts'
+            docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
+              'set -e; bash -n /opt/ollama-open-webui/start.sh; test -x /start.sh; bash -n /start.sh; ls -l /start.sh /opt/ollama-open-webui/start.sh'
+
+            echo '### Build residue checks'
+            docker run --rm --entrypoint /bin/bash "$IMAGE_TAG" -c \
+              'set -e; test ! -e /opt/ollama-dist/ollama-linux-amd64.tar.zst; test ! -d /root/.cache/pip; test ! -d /root/.cache/huggingface'
+
+            echo '### Final disk state'
+            df -h
+            docker system df
+          } 2>&1 | tee -a "$BUILD_LOG"
+
+      - name: Detect disk-space failure
+        if: failure()
+        shell: bash
+        run: |
+          {
+            echo '### Failure diagnostics'
+            date --iso-8601=seconds
+            df -h
+            docker system df || true
+            echo '### ENOSPC matches'
+            grep -Ein 'no space left on device|ENOSPC|filesystem is full' "$BUILD_LOG" || true
+          } 2>&1 | tee -a "$BUILD_LOG"
+
+      - name: Upload build and test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: runpod-comfyui-build-test-log-${{ github.run_id }}
+          path: build-test.log
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 9

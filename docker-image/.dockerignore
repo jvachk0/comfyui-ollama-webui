@@ -1,0 +1,7 @@
+*
+!Dockerfile
+!start.sh
+!requirements-open-webui.txt
+!zstdcat.c
+!versions.env
+!README.md

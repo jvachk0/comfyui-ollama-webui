@@ -1,0 +1,3 @@
+# Version proven on the official runpod/comfyui:cuda13.0 image on 2026-08-08.
+# Its transitive resolver result included torch 2.13.0+cu130.
+open-webui==0.11.0
